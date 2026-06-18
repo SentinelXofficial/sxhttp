@@ -23,6 +23,11 @@ type Config struct {
 	NoSize    bool
 	ShowCred  bool
 	ShowRedir bool
+	ShowIP    bool
+	ShowTLS   bool
+	ShowFavicon bool
+	ShowHash  bool
+	ShowMethod bool
 }
 
 // PrintResult prints a single scan result to stdout.
@@ -44,11 +49,13 @@ func PrintResult(r checker.Result, cfg Config) {
 		return
 	}
 
+	// ── WAF label ─────────────────────────────────────────────────────────
 	wafLabel := ""
 	if !cfg.NoWAF && r.WAF != "" {
 		wafLabel = "  " + color.MAG + "[" + r.WAF + "]" + color.RST
 	}
 
+	// ── Tech label ────────────────────────────────────────────────────────
 	techLabel := ""
 	if !cfg.NoTech && len(r.Tech) > 0 {
 		t := make([]string, len(r.Tech))
@@ -65,40 +72,91 @@ func PrintResult(r checker.Result, cfg Config) {
 		techLabel = "  " + color.CYN + "[" + strings.Join(t, ", ") + "]" + color.RST
 	}
 
+	// ── Title label ───────────────────────────────────────────────────────
 	titleLabel := ""
 	if !cfg.NoTitle && r.Title != "" {
 		titleLabel = "  " + color.GRY + color.DIM + "\"" + r.Title + "\"" + color.RST
 	}
 
+	// ── Size label ────────────────────────────────────────────────────────
 	sizeLabel := ""
 	if !cfg.NoSize {
 		sizeLabel = "  " + color.Size(r.ContentLength)
 	}
 
-	fmt.Printf("  [%s]  %-20s  %-10s%s  %s%s%s%s\n",
+	// ── Method label ──────────────────────────────────────────────────────
+	methodLabel := ""
+	if cfg.ShowMethod && r.Method != "" && r.Method != "GET" {
+		methodLabel = "  " + color.YEL + "[" + r.Method + "]" + color.RST
+	}
+
+	// ── Main line ─────────────────────────────────────────────────────────
+	fmt.Printf("  [%s]  %-20s  %-10s%s  %s%s%s%s%s\n",
 		color.Status(r.Code),
 		color.GRY+r.Desc+color.RST,
 		color.RT(r.ResponseTime),
 		sizeLabel,
 		r.URL,
+		methodLabel,
 		wafLabel,
 		techLabel,
 		titleLabel,
 	)
 
+	// ── IP ────────────────────────────────────────────────────────────────
+	if cfg.ShowIP && r.IP != "" {
+		fmt.Printf("       "+color.GRY+color.DIM+"IP     : %s"+color.RST+"\n", r.IP)
+	}
+
+	// ── TLS ───────────────────────────────────────────────────────────────
+	if cfg.ShowTLS && r.TLS != nil {
+		tls := r.TLS
+		expiryStr := tls.Expiry
+		if tls.Expired {
+			expiryStr += color.RED + " [EXPIRED]" + color.RST
+		}
+		fmt.Printf("       "+color.GRY+color.DIM+"TLS    : %s / %s / CN=%s / exp:%s"+color.RST+"\n",
+			tls.Version, tls.Cipher, tls.Subject, expiryStr)
+		if len(tls.SANs) > 0 {
+			shown := tls.SANs
+			if len(shown) > 5 {
+				shown = shown[:5]
+			}
+			fmt.Printf("       "+color.GRY+color.DIM+"SANs   : %s"+color.RST+"\n",
+				strings.Join(shown, ", "))
+		}
+	}
+
+	// ── Hashes ───────────────────────────────────────────────────────────
+	if cfg.ShowHash && len(r.Hashes) > 0 {
+		parts := make([]string, 0, len(r.Hashes))
+		for k, v := range r.Hashes {
+			parts = append(parts, k+":"+v)
+		}
+		fmt.Printf("       "+color.GRY+color.DIM+"Hash   : %s"+color.RST+"\n", strings.Join(parts, "  "))
+	}
+
+	// ── Favicon hash ─────────────────────────────────────────────────────
+	if cfg.ShowFavicon && r.FaviconHash != "" {
+		fmt.Printf("       "+color.YEL+"Favicon: mmh3:%s  →  shodan: http.favicon.hash:%s"+color.RST+"\n",
+			r.FaviconHash, r.FaviconHash)
+	}
+
+	// ── Redirects ────────────────────────────────────────────────────────
 	if cfg.ShowRedir && len(r.Redirects) > 0 {
 		for _, redir := range r.Redirects {
 			fmt.Printf("       "+color.GRY+color.DIM+"↳ %s"+color.RST+"\n", redir)
 		}
 	}
 
+	// ── Default creds ─────────────────────────────────────────────────────
 	if cfg.ShowCred && r.DefaultCred != "" {
 		fmt.Printf("       "+color.YEL+"[CRED] %s"+color.RST+"\n", r.DefaultCred)
 	}
 }
 
 // PrintSummary prints the final scan statistics.
-func PrintSummary(results []checker.Result, elapsed float64, save, saveJSON, saveCSV string) {
+func PrintSummary(results []checker.Result, elapsed float64, save, saveJSON, saveCSV, storeDir string) {
 	var s200, s3xx, s4xx, s5xx, sErr int
 	for _, r := range results {
 		switch {
@@ -135,6 +193,9 @@ func PrintSummary(results []checker.Result, elapsed float64, save, saveJSON, sav
 	}
 	if saveCSV != "" {
 		fmt.Printf("  "+color.GRY+"CSV saved to %s%s\n"+color.RST, color.BOLD+saveCSV, color.RST)
+	}
+	if storeDir != "" {
+		fmt.Printf("  "+color.GRY+"Responses stored in %s%s\n"+color.RST, color.BOLD+storeDir, color.RST)
 	}
 	fmt.Println()
 }
@@ -186,20 +247,38 @@ func SaveCSV(path string, results []checker.Result) {
 	defer f.Close()
 	w := csv.NewWriter(f)
 	w.Write([]string{
-		"url", "status_code", "status_desc", "title",
-		"tech", "cms_version", "waf",
+		"url", "method", "status_code", "status_desc", "title",
+		"tech", "cms_version", "waf", "ip",
+		"tls_version", "tls_cipher", "tls_subject", "tls_expiry",
+		"favicon_hash", "hashes",
 		"response_time_ms", "content_length",
 		"redirects", "default_cred",
 	})
 	for _, r := range results {
+		tlsVersion, tlsCipher, tlsSubject, tlsExpiry := "", "", "", ""
+		if r.TLS != nil {
+			tlsVersion = r.TLS.Version
+			tlsCipher = r.TLS.Cipher
+			tlsSubject = r.TLS.Subject
+			tlsExpiry = r.TLS.Expiry
+		}
+		hashParts := make([]string, 0, len(r.Hashes))
+		for k, v := range r.Hashes {
+			hashParts = append(hashParts, k+":"+v)
+		}
 		w.Write([]string{
 			r.URL,
+			r.Method,
 			strconv.Itoa(r.Code),
 			r.Desc,
 			r.Title,
 			strings.Join(r.Tech, "|"),
 			r.CMSVersion,
 			r.WAF,
+			r.IP,
+			tlsVersion, tlsCipher, tlsSubject, tlsExpiry,
+			r.FaviconHash,
+			strings.Join(hashParts, "|"),
 			strconv.FormatInt(r.ResponseTime, 10),
 			strconv.FormatInt(r.ContentLength, 10),
 			strings.Join(r.Redirects, " | "),
